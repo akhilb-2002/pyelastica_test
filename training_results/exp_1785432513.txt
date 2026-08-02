@@ -1,0 +1,65 @@
+Args: {'csv': ['csv_timeseries_pyelastica/case_1_fixed_10mm/collected_trajectories_koopman_timeseries.csv', 'csv_timeseries_pyelastica/case_2_fixed_50mm/collected_trajectories_koopman_timeseries.csv', 'csv_timeseries_pyelastica/case_3_random_1_10mm/collected_trajectories_koopman_timeseries.csv', 'csv_timeseries_pyelastica/case_4_random_10_80mm/collected_trajectories_koopman_timeseries.csv'], 'features': ['pos', 'vel'], 'horizon': 10, 'koopman_dim': 256, 'hidden_dim': 256, 'num_hidden': 2, 'epochs': 50, 'batch_size': 64, 'lr': 0.001, 'val_frac': 0.2, 'test_frac': 0.1, 'w_pred': 1.0, 'w_recon': 0.5, 'w_lin': 0.1, 'w_stab': 0.0, 'gamma': 1.0, 'clamp_tol_mm': 1.0, 'no_normalize': False, 'no_operator_bias': False, 'results_dir': 'training_results', 'save': None, 'seed': 0}
+Loaded 36000 windows (H=10) | 30 nodes, 29 edges | features ['pos', 'vel'] -> state_dim 120 | control_dim 2 | device mps
+Cases: 0=case_1_fixed_10mm, 1=case_2_fixed_50mm, 2=case_3_random_1_10mm, 3=case_4_random_10_80mm
+0.00% of rows have node 0 further than 1.0 mm from its commanded target (clamped / still catching up).
+Train 25200 | Val 7200 | Test 3600 windows from 400 trajectories
+Parameters: 391,288
+epoch 001 | train 0.88715 (pred 0.63183 recon 0.50283 lin 0.03901) | val 0.72497 (pred 0.52809) | val rmse 6.724/15.452 mm | rho(A) 1.065  *
+epoch 002 | train 0.73902 (pred 0.54440 recon 0.38438 lin 0.02435) | val 0.66998 (pred 0.49667) | val rmse 5.506/13.693 mm | rho(A) 1.048  *
+epoch 003 | train 0.68612 (pred 0.51499 recon 0.33702 lin 0.02615) | val 0.63472 (pred 0.48172) | val rmse 4.996/13.022 mm | rho(A) 1.022  *
+epoch 004 | train 0.65469 (pred 0.50255 recon 0.29867 lin 0.02807) | val 0.60595 (pred 0.47117) | val rmse 4.774/12.282 mm | rho(A) 1.013  *
+epoch 005 | train 0.62381 (pred 0.49153 recon 0.25840 lin 0.03076) | val 0.58416 (pred 0.46899) | val rmse 4.785/12.601 mm | rho(A) 1.020  *
+epoch 006 | train 0.59484 (pred 0.48189 recon 0.21922 lin 0.03343) | val 0.55957 (pred 0.45827) | val rmse 4.597/11.665 mm | rho(A) 1.022  *
+epoch 007 | train 0.57440 (pred 0.47576 recon 0.19035 lin 0.03454) | val 0.54566 (pred 0.45745) | val rmse 4.367/11.801 mm | rho(A) 1.017  *
+epoch 008 | train 0.55822 (pred 0.47103 recon 0.16738 lin 0.03499) | val 0.53322 (pred 0.45479) | val rmse 4.335/11.707 mm | rho(A) 1.018  *
+epoch 009 | train 0.54253 (pred 0.46573 recon 0.14649 lin 0.03562) | val 0.52311 (pred 0.45192) | val rmse 4.314/11.321 mm | rho(A) 1.016  *
+epoch 010 | train 0.53069 (pred 0.46184 recon 0.13056 lin 0.03568) | val 0.51233 (pred 0.44976) | val rmse 4.216/11.273 mm | rho(A) 1.021  *
+epoch 011 | train 0.52067 (pred 0.45886 recon 0.11639 lin 0.03610) | val 0.50865 (pred 0.45141) | val rmse 4.275/11.309 mm | rho(A) 1.016
+epoch 012 | train 0.51277 (pred 0.45626 recon 0.10579 lin 0.03627) | val 0.50333 (pred 0.45117) | val rmse 4.100/11.332 mm | rho(A) 1.017
+epoch 013 | train 0.50448 (pred 0.45350 recon 0.09469 lin 0.03630) | val 0.49316 (pred 0.44675) | val rmse 3.985/11.385 mm | rho(A) 1.017  *
+epoch 014 | train 0.49826 (pred 0.45090 recon 0.08748 lin 0.03627) | val 0.49477 (pred 0.44955) | val rmse 4.051/11.251 mm | rho(A) 1.015
+epoch 015 | train 0.49143 (pred 0.44783 recon 0.08001 lin 0.03591) | val 0.48656 (pred 0.44575) | val rmse 4.095/10.926 mm | rho(A) 1.016  *
+epoch 016 | train 0.48851 (pred 0.44735 recon 0.07516 lin 0.03576) | val 0.48367 (pred 0.44448) | val rmse 4.104/10.892 mm | rho(A) 1.017  *
+epoch 017 | train 0.48172 (pred 0.44452 recon 0.06722 lin 0.03591) | val 0.47907 (pred 0.44295) | val rmse 3.984/10.783 mm | rho(A) 1.020  *
+epoch 018 | train 0.47696 (pred 0.44262 recon 0.06154 lin 0.03572) | val 0.47962 (pred 0.44578) | val rmse 4.027/10.974 mm | rho(A) 1.023
+epoch 019 | train 0.47249 (pred 0.44038 recon 0.05711 lin 0.03557) | val 0.47217 (pred 0.44199) | val rmse 3.800/10.772 mm | rho(A) 1.015  *
+epoch 020 | train 0.46891 (pred 0.43912 recon 0.05249 lin 0.03551) | val 0.47740 (pred 0.44725) | val rmse 4.150/10.876 mm | rho(A) 1.014
+epoch 021 | train 0.46423 (pred 0.43712 recon 0.04714 lin 0.03545) | val 0.47180 (pred 0.44392) | val rmse 4.013/10.969 mm | rho(A) 1.016
+epoch 022 | train 0.46251 (pred 0.43654 recon 0.04494 lin 0.03503) | val 0.46919 (pred 0.44337) | val rmse 4.032/10.822 mm | rho(A) 1.012
+epoch 023 | train 0.45982 (pred 0.43558 recon 0.04145 lin 0.03517) | val 0.46794 (pred 0.44485) | val rmse 3.881/10.917 mm | rho(A) 1.018
+epoch 024 | train 0.45557 (pred 0.43337 recon 0.03738 lin 0.03514) | val 0.46801 (pred 0.44582) | val rmse 4.016/11.055 mm | rho(A) 1.012
+epoch 025 | train 0.45346 (pred 0.43269 recon 0.03457 lin 0.03484) | val 0.46571 (pred 0.44493) | val rmse 3.959/10.745 mm | rho(A) 1.015
+epoch 026 | train 0.45061 (pred 0.43113 recon 0.03202 lin 0.03469) | val 0.46454 (pred 0.44390) | val rmse 4.095/10.920 mm | rho(A) 1.009
+epoch 027 | train 0.44738 (pred 0.42977 recon 0.02827 lin 0.03477) | val 0.46054 (pred 0.44262) | val rmse 3.917/10.621 mm | rho(A) 1.011
+epoch 028 | train 0.44525 (pred 0.42868 recon 0.02621 lin 0.03467) | val 0.45837 (pred 0.44231) | val rmse 3.824/10.572 mm | rho(A) 1.015
+epoch 029 | train 0.44305 (pred 0.42747 recon 0.02427 lin 0.03445) | val 0.45602 (pred 0.44024) | val rmse 3.805/10.331 mm | rho(A) 1.011  *
+epoch 030 | train 0.44099 (pred 0.42628 recon 0.02255 lin 0.03435) | val 0.45755 (pred 0.44169) | val rmse 3.987/10.585 mm | rho(A) 1.013
+epoch 031 | train 0.44062 (pred 0.42613 recon 0.02213 lin 0.03422) | val 0.45632 (pred 0.44150) | val rmse 3.903/10.330 mm | rho(A) 1.009
+epoch 032 | train 0.43743 (pred 0.42395 recon 0.02021 lin 0.03381) | val 0.45909 (pred 0.44349) | val rmse 3.896/10.619 mm | rho(A) 1.012
+epoch 033 | train 0.43683 (pred 0.42317 recon 0.02058 lin 0.03378) | val 0.45735 (pred 0.44191) | val rmse 3.896/10.592 mm | rho(A) 1.016
+epoch 034 | train 0.43657 (pred 0.42281 recon 0.02079 lin 0.03363) | val 0.45612 (pred 0.44152) | val rmse 3.676/10.357 mm | rho(A) 1.020
+epoch 035 | train 0.43442 (pred 0.42106 recon 0.02001 lin 0.03353) | val 0.45657 (pred 0.44182) | val rmse 3.782/10.553 mm | rho(A) 1.013
+epoch 036 | train 0.43329 (pred 0.42029 recon 0.01930 lin 0.03344) | val 0.45411 (pred 0.44161) | val rmse 3.806/10.295 mm | rho(A) 1.010
+epoch 037 | train 0.43299 (pred 0.41979 recon 0.01973 lin 0.03339) | val 0.46156 (pred 0.44429) | val rmse 3.982/10.516 mm | rho(A) 1.015
+epoch 038 | train 0.43258 (pred 0.41948 recon 0.01958 lin 0.03314) | val 0.45562 (pred 0.44310) | val rmse 3.784/10.612 mm | rho(A) 1.015
+epoch 039 | train 0.43006 (pred 0.41768 recon 0.01808 lin 0.03337) | val 0.45719 (pred 0.44343) | val rmse 3.796/10.497 mm | rho(A) 1.008
+epoch 040 | train 0.43065 (pred 0.41787 recon 0.01892 lin 0.03327) | val 0.45367 (pred 0.44118) | val rmse 3.683/10.459 mm | rho(A) 1.007
+epoch 041 | train 0.42854 (pred 0.41626 recon 0.01788 lin 0.03334) | val 0.45442 (pred 0.44191) | val rmse 3.653/10.300 mm | rho(A) 1.009
+epoch 042 | train 0.42816 (pred 0.41612 recon 0.01745 lin 0.03318) | val 0.45609 (pred 0.44283) | val rmse 3.783/10.369 mm | rho(A) 1.011
+epoch 043 | train 0.42756 (pred 0.41527 recon 0.01797 lin 0.03301) | val 0.45452 (pred 0.44236) | val rmse 3.715/10.552 mm | rho(A) 1.008
+epoch 044 | train 0.42670 (pred 0.41418 recon 0.01848 lin 0.03284) | val 0.45532 (pred 0.44204) | val rmse 3.835/10.459 mm | rho(A) 1.012
+epoch 045 | train 0.42564 (pred 0.41335 recon 0.01798 lin 0.03294) | val 0.45553 (pred 0.44262) | val rmse 3.691/10.341 mm | rho(A) 1.010
+epoch 046 | train 0.42556 (pred 0.41337 recon 0.01781 lin 0.03283) | val 0.45772 (pred 0.44290) | val rmse 3.752/10.598 mm | rho(A) 1.006
+epoch 047 | train 0.42584 (pred 0.41353 recon 0.01803 lin 0.03298) | val 0.45597 (pred 0.44341) | val rmse 3.824/10.490 mm | rho(A) 0.999
+epoch 048 | train 0.42374 (pred 0.41163 recon 0.01764 lin 0.03295) | val 0.45941 (pred 0.44508) | val rmse 3.820/10.385 mm | rho(A) 1.009
+epoch 049 | train 0.42295 (pred 0.41117 recon 0.01698 lin 0.03285) | val 0.45405 (pred 0.44138) | val rmse 3.821/10.315 mm | rho(A) 1.007
+epoch 050 | train 0.42266 (pred 0.41083 recon 0.01708 lin 0.03286) | val 0.45519 (pred 0.44235) | val rmse 3.681/10.304 mm | rho(A) 1.008
+
+Best val rollout MSE: 0.440242  (normalized units)
+Test rollout MSE 0.467821 | position RMSE 3.745 mm @h=1, 10.571 mm @h=10
+Per-horizon test MSE: h1=0.38822, h2=0.41273, h3=0.43029, h4=0.44634, h5=0.46131, h6=0.47680, h7=0.49328, h8=0.50760, h9=0.52248, h10=0.53915
+Per-case test MSE:
+    case_1_fixed_10mm        0.050104
+    case_2_fixed_50mm        1.038434
+    case_3_random_1_10mm     0.017261
+    case_4_random_10_80mm    0.765484

@@ -1,0 +1,30 @@
+Case 4: random_10_80mm
+Motion profile: teleport
+
+Collection parameters:
+  num_trajectories       : 100
+  actions_per_trajectory : 5
+  timesteps_per_action   : 20
+  koopman_step_dt        : 0.0100 s
+  rows_per_trajectory    : 100
+  rope_reach_mm          : 300.0000
+  max_reach_frac         : 0.9
+  seed                   : None
+
+Rope physics parameters (PyElastica, SI internally):
+  num_rope_points    : 30
+  base_length        : 300.0 mm
+  radius             : 3.0 mm
+  youngs_modulus     : 1.000e+06 (SI)
+  damping            : 2.0
+  sim_dt / substeps  : 5.0e-05 s / 200 per step
+
+CSV: collected_trajectories_koopman_timeseries.csv (long format, one row per (trajectory_id, action_idx, step_idx)):
+  trajectory_id, action_idx, step_idx : rollout / action / within-action step
+  pos_x_i, pos_y_i (i=0..N-1)          : rope node positions (mm)
+  vel_x_i, vel_y_i, ang_vel_z_i        : node linear/angular velocities (mm/s, rad/s)
+  curvature_i                          : local turning angle at each node (rad)
+  edge_dx_i, edge_dy_i, edge_length_i  : edge vectors/lengths (mm)
+  cmd_dx, cmd_dy                       : Node-0 displacement applied ON THIS STEP (mm).
+                                         Zero on held steps; rope motion there is autonomous.
+  target_x, target_y                   : commanded absolute Node-0 position this step (mm).
