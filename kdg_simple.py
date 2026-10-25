@@ -9,21 +9,31 @@ CASE DESIGN
 -----------
 The reachable set of node 0 is a disc of radius L = 300 mm centred on the fixed
 node. Distance from that centre determines how curled the rope must be: near the
-rim it is nearly straight, near the centre it must coil. So covering the DISC is
-the same thing as covering rope configurations, and that is what these cases do.
+rim it is nearly straight, near the centre it must coil. Covering the DISC is
+therefore the same thing as covering rope configurations.
 
-Each trajectory samples waypoints uniformly BY AREA in the annulus and drives
-node 0 toward them across several ramped actions. This is the key difference from
-the earlier random-angle design, which redrew a fresh bearing every action and so
-random-walked (net travel ~ sqrt(n) x action size) instead of covering ground.
+Each trajectory samples waypoints uniformly BY AREA in that disc and drives node 0
+toward them across several ramped actions. Consecutive actions share a bearing
+until the waypoint is reached, so the rope accumulates net travel instead of
+random-walking (which is what a fresh random angle per action produces:
+net displacement ~ sqrt(n) x action size).
+
+EVERY TRAJECTORY STARTS FROM THE EXACT SETTLED STRAIGHT ROPE. The earlier
+generator called randomize_shape() first, so the pristine straight configuration
+never appeared in the training data -- yet it is where every letter trace begins.
+Measured on the resulting model: the straight rope encoded to |z| = 1.56 against a
+training max of ~1.0, and reconstructed with 6.98 mm error, with the decoder
+emitting a non-monotonic zigzag. Start diversity is not needed here: a trajectory
+that drives to a near-centre waypoint IS a curled configuration, recorded rather
+than discarded.
 
 All motion is ramped -- no teleports. Impulsive inputs were measured to give ~50x
 higher MSE than ramps at matched amplitude, and the MPC only ever emits smooth
-per-step commands, so impulse data actively pollutes the operator.
+per-step commands.
 
 Magnitude convention: `magnitude` is the TOTAL action displacement in mm, spread
-evenly over the driven steps by _ramp. Per-step motion is magnitude / T_drive,
-which is the quantity that must stay under U_MAX_MM.
+evenly over the driven steps. Per-step motion is magnitude / T_drive, which is
+what must stay under U_MAX_MM.
 
 Usage:
     python koopman_data_gen.py all --num-trajectories 100 --seed 0
@@ -80,18 +90,14 @@ def _pname(profile):
 # ─────────────────────────────────────────────
 CASES = {
     # ---- the workhorse: full-disc coverage at nominal speed ----------------
-    1: dict(name="disc_nominal",  magnitude=lambda: float(np.random.uniform(5.0, 20.0)),
-            profile=_ramp, T=20, n_actions=40,          # 0.25 - 1.0 mm/step
-            waypoints=dict(radius_frac=(0.30, 0.95))),
-    # ---- fine motion: the precision regime every trace ENDS in -------------
-    2: dict(name="disc_fine",     magnitude=lambda: float(np.random.uniform(0.5, 5.0)),
-            profile=_ramp, T=20, n_actions=40,          # 0.025 - 0.25 mm/step
+    1: dict(name="disc_nominal",  magnitude=lambda: float(np.random.uniform(1.0, 20.0)),
+            profile=_ramp, T=20, n_actions=40,          # 0.05 - 1.0 mm/step
             waypoints=dict(radius_frac=(0.30, 0.95))),
     # ---- upper speed band: shorter holds, larger steps --------------------
     3: dict(name="disc_fast",     magnitude=lambda: float(np.random.uniform(10.0, 20.0)),
             profile=_ramp, T=10, n_actions=40,          # 1.0 - 2.0 mm/step
             waypoints=dict(radius_frac=(0.30, 0.95))),
-    # ---- deep interior + rim, alternating: waypoints near the centre force a
+    # ---- deep interior + rim, alternating: near-centre waypoints force a
     #      tight coil, and swinging back out forces the UNCURL that letter
     #      tracing needs. Outward-only data leaves the operator one-directional.
     4: dict(name="radial_sweep",  magnitude=lambda: float(np.random.uniform(5.0, 20.0)),
@@ -109,7 +115,7 @@ CASES = {
             waypoints=dict(radius_frac=(0.25, 0.95), alternate=True)),
 }
 
-TRAIN_CASES = [1, 2, 3, 4, 5]
+TRAIN_CASES = [1, 3, 4, 5]
 HELDOUT_CASES = [6]
 
 
@@ -148,13 +154,12 @@ print("Cases to collect: " + ", ".join(f"{c}={CASES[c]['name']}" for c in SELECT
 MAX_REACH_FRAC = 0.95      # hard ceiling on |node0 - fixed| / rope_reach
 WAYPOINT_TOL = 8.0         # mm; within this, the waypoint counts as reached
 WAYPOINT_JITTER = 0.25     # rad; spread around the exact bearing to the waypoint
-RANDOMIZE_SCALE = 0.1      # shape-randomization force std (N)
+V_WARN_MM_S = 1000.0       # flag trajectories whose peak node speed exceeds this
 
-OUT_ROOT = Path(__file__).resolve().parent / "csv_timeseries_pyelastica_simple"
+OUT_ROOT = Path(__file__).resolve().parent / "csv_timeseries_pyelastica_simple_no_random"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 print("Initializing PyElastica RopeManipEnv ...")
-
 env = RopeManipEnv(
     n_nodes=30, base_length=0.30, base_radius=0.003,
     youngs_modulus=1e6, damping=2.0, dt=5e-5, control_dt=0.01, seed=args.seed,
@@ -171,25 +176,31 @@ print(f"Rope reach: {ROPE_REACH:.2f} mm | fixed node at {FIXED_NODE_POS} mm")
 print(f"Waypoint disc spans {0.25 * ROPE_REACH:.1f} - {0.95 * ROPE_REACH:.1f} mm from centre")
 
 
-def sample_waypoint(r_lo_frac, r_hi_frac, want_inner=None):
+def sample_waypoint(r_lo_frac, r_hi_frac, want_inner=None, near=None, max_dist=None):
     """A point in the reachable annulus, uniform BY AREA.
 
     r = R * sqrt(U), not r = R * U -- sampling the radius uniformly would
     concentrate points near the centre, over-representing deep coils and
-    starving the mid-radius band where most letter shapes actually live.
+    starving the mid-radius band where most letter shapes live.
 
     want_inner True/False forces the inner or outer third of the annulus; used
     by the alternating radial case to guarantee curl <-> uncurl transitions.
+    max_dist caps how far the waypoint may be from `near`, so a case that moves
+    in small steps is not left aiming at a target 200 mm away for its whole run.
     """
     lo, hi = r_lo_frac, r_hi_frac
     if want_inner is True:
         hi = lo + 0.35 * (hi - lo)
     elif want_inner is False:
         lo = hi - 0.35 * (hi - lo)
-    u = np.random.uniform(lo ** 2, hi ** 2)
-    r = ROPE_REACH * np.sqrt(u)
-    th = np.random.uniform(0.0, 2 * np.pi)
-    return FIXED_NODE_POS + r * np.array([np.cos(th), np.sin(th)])
+    for _ in range(50):
+        u = np.random.uniform(lo ** 2, hi ** 2)
+        r = ROPE_REACH * np.sqrt(u)
+        th = np.random.uniform(0.0, 2 * np.pi)
+        wp = FIXED_NODE_POS + r * np.array([np.cos(th), np.sin(th)])
+        if max_dist is None or near is None or np.linalg.norm(wp - near) <= max_dist:
+            return wp
+    return wp          # give up on the distance cap rather than loop forever
 
 
 # ─────────────────────────────────────────────
@@ -243,12 +254,15 @@ def write_description(path, case_id, case, csv_name):
     with open(path, "w") as f:
         f.write(f"Case {case_id}: {case['name']}\n")
         f.write(f"Motion profile: {_pname(case['profile'])} (ramped; no impulses)\n")
-        f.write("Magnitude convention: mm total per action, spread over T_drive steps\n\n")
+        f.write("Magnitude convention: mm total per action, spread over T_drive steps\n")
+        f.write("Start state: EXACT settled straight rope (no randomize_shape)\n\n")
         f.write("Collection parameters:\n")
         f.write(f"  num_trajectories       : {NUM_TRAJECTORIES}\n")
         f.write(f"  actions_per_trajectory : {case['n_actions']}\n")
         f.write(f"  timesteps_per_action   : {T}\n")
         f.write(f"  driven_steps_per_action: {T_drive}\n")
+        f.write(f"  mm_per_step range      : "
+                f"{case['magnitude'].__doc__ or ''}\n")
         f.write(f"  u_max_mm_per_step      : {U_MAX_MM}\n")
         f.write(f"  koopman_step_dt        : {DT:.4f} s\n")
         f.write(f"  rows_per_trajectory    : {case['n_actions'] * T}\n")
@@ -256,6 +270,7 @@ def write_description(path, case_id, case, csv_name):
         f.write(f"  max_reach_frac         : {MAX_REACH_FRAC}\n")
         f.write(f"  waypoint_radius_frac   : {wp['radius_frac'][0]:.2f} - {wp['radius_frac'][1]:.2f}\n")
         f.write(f"  waypoint_alternate     : {wp.get('alternate', False)}\n")
+        f.write(f"  waypoint_max_dist_mm   : {wp.get('max_dist')}\n")
         f.write(f"  waypoint_tol_mm        : {WAYPOINT_TOL}\n")
         f.write(f"  waypoint_jitter_rad    : {WAYPOINT_JITTER}\n")
         f.write(f"  seed                   : {args.seed}\n\n")
@@ -282,6 +297,7 @@ def collect_case(case_id):
     wp_spec = case["waypoints"]
     r_lo, r_hi = wp_spec["radius_frac"]
     alternate = wp_spec.get("alternate", False)
+    max_dist = wp_spec.get("max_dist")
 
     dest_dir = OUT_ROOT / f"case_{case_id}_{case['name']}"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -295,23 +311,26 @@ def collect_case(case_id):
           f"({n_actions} actions x {T} steps = {n_actions * T} rows/traj) ===")
     print(f"    -> {csv_path}")
 
-    radii = []          # |node0 - centre| visited, for the coverage report
+    radii, vpeaks = [], []
     case_start = time.time()
     traj_idx = 1
     pbar = tqdm(total=NUM_TRAJECTORIES, desc=f"case {case_id} ({case['name']})")
 
     while traj_idx <= NUM_TRAJECTORIES:
+        # Exact settled straight rope. No randomize_shape: the straight state is
+        # where every letter trace begins, and it has to be in the training set.
         env.reset()
-        env.randomize_shape(force_scale=RANDOMIZE_SCALE)
         if env.is_exploded():
             continue
 
         target_node_pos = env.driven_position(mm=True)[:2].copy()
         traj_rows = []
         exploded = False
+        vpeak = 0.0
 
         want_inner = True if alternate else None
-        waypoint = sample_waypoint(r_lo, r_hi, want_inner)
+        waypoint = sample_waypoint(r_lo, r_hi, want_inner,
+                                   near=target_node_pos, max_dist=max_dist)
 
         for action_idx in range(n_actions):
             # --- new waypoint once the current one is reached ---------------
@@ -319,7 +338,8 @@ def collect_case(case_id):
             if np.linalg.norm(d) < WAYPOINT_TOL:
                 if alternate:
                     want_inner = not want_inner
-                waypoint = sample_waypoint(r_lo, r_hi, want_inner)
+                waypoint = sample_waypoint(r_lo, r_hi, want_inner,
+                                           near=target_node_pos, max_dist=max_dist)
                 d = waypoint - target_node_pos
 
             # --- head toward it; never overshoot it or the reach limit ------
@@ -329,9 +349,16 @@ def collect_case(case_id):
 
             direction = np.array([np.cos(angle), np.sin(angle)])
             endpoint = target_node_pos + magnitude * direction
-            if np.linalg.norm(endpoint - FIXED_NODE_POS) > MAX_REACH_FRAC * ROPE_REACH:
-                waypoint = sample_waypoint(r_lo, r_hi, want_inner)
-                continue          # skip this action rather than pull past the limit
+            over = (np.linalg.norm(endpoint - FIXED_NODE_POS)
+                    - MAX_REACH_FRAC * ROPE_REACH)
+            if over > 0:
+                # shrink the action to land on the limit rather than skipping it,
+                # which would silently drop rows and stall the trajectory
+                magnitude = max(0.0, magnitude - over)
+                waypoint = sample_waypoint(r_lo, r_hi, want_inner,
+                                           near=target_node_pos, max_dist=max_dist)
+            if magnitude < 1e-6:
+                continue
 
             step_command = case["profile"](magnitude, angle, T)
 
@@ -347,6 +374,7 @@ def collect_case(case_id):
                 positions = env.get_positions(mm=True)
                 velocities = env.get_velocities(mm=True)
                 ang_vel_z = env.get_node_angular_velocity_z()
+                vpeak = max(vpeak, float(np.abs(velocities[:, :2]).max()))
                 traj_rows.append(
                     build_row(traj_idx, action_idx, step_idx,
                               positions, velocities, ang_vel_z,
@@ -360,12 +388,13 @@ def collect_case(case_id):
 
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerows(traj_rows)
+        vpeaks.append(vpeak)
         pbar.update(1)
         traj_idx += 1
 
     pbar.close()
 
-    # --- disc coverage report: the whole point of this design ---------------
+    # --- disc coverage report: the point of the whole design ----------------
     if radii:
         r = np.array(radii) / ROPE_REACH
         hist, _ = np.histogram(r, bins=np.linspace(0.0, 1.0, 11))
@@ -373,6 +402,11 @@ def collect_case(case_id):
         print(f"    decile counts 0.0 -> 1.0: {hist.tolist()}")
         if (hist[2:9] == 0).any():
             print("    <-- EMPTY BANDS in the mid-disc; widen radius_frac or raise n_actions")
+    if vpeaks:
+        v = np.array(vpeaks)
+        print(f"    peak node speed mm/s: mean {v.mean():.0f}  max {v.max():.0f}"
+              + ("  <-- rope is being yanked; lower the magnitude range"
+                 if v.max() > V_WARN_MM_S else ""))
 
     elapsed = time.time() - case_start
     print(f"    case {case_id} done in {elapsed / 60:.2f} min")

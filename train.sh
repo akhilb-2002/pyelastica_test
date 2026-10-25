@@ -14,9 +14,9 @@ set -euo pipefail
 #                rho(A) toward the unit circle. 15/22 give decay data instead.
 # ─────────────────────────────────────────────────────────────
 
-DATA_ROOT="csv_timeseries_pyelastica_simple"
+DATA_ROOT="csv_timeseries_pyelastica_simple_no_random"
 CSV_NAME="collected_trajectories_koopman_timeseries.csv"
-SCRIPT="ngk_simple.py"
+SCRIPT="ngk_shifted.py"
 HORIZON=10
 
 TRAIN_CASES=(1 3 4 5 6)
@@ -47,9 +47,17 @@ for n in "${TRAIN_CASES[@]}"; do
 done
 
 
-python3 "${SCRIPT}" \
+# python3 "${SCRIPT}" \
+#   --csv "${CSV_ARGS[@]}" \
+#   --horizon "${HORIZON}" \
+#   --w-pred 1 \
+#   --w-recon 0.5 \
+#   --w-lin 0.1 \
+#   --w-stab 0 \
+#   --w-seg 1e-4 \
+  
+python3 edmd_baseline.py \
   --csv "${CSV_ARGS[@]}" \
-  --horizon "${HORIZON}" \
-  --w-stab 1e-2 \
-  --w-seg 1e-4 \
-  --encoded-control-dim 2 
+  --lift rbf \
+  --n-rbf 200 \
+  --ridge 1e-4

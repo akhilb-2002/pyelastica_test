@@ -52,6 +52,7 @@ Losses (see KoopmanLoss)
   recon  : autoencoder consistency, decode(encode(x_k)) vs x_k
   lin    : latent linearity, rolled-forward z_k+h vs encode(x_k+h)
   stab   : hinge on the spectral norm of A, keeps long rollouts from diverging
+  inex   : inextensibility penalty on the predicted chain, penalises edge lengths
 
 Usage
 -----
@@ -66,7 +67,6 @@ from time import time
 import numpy as np
 import pandas as pd
 from pygments.unistring import Lo
-from sympy import gamma
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset
@@ -83,7 +83,7 @@ FEATURE_GROUPS = {
     "pos":    (("pos_x_", "pos_y_"), "node"),
     "vel":    (("vel_x_", "vel_y_"), "node"),
 }
-DEFAULT_FEATURES = ("pos", "vel") 
+DEFAULT_FEATURES = ("pos",) 
 
 ROPE_NUM_NODES = 30
 ROPE_LENGTH_MM = 300.0
@@ -236,11 +236,9 @@ class RopeKoopmanDataset(Dataset):
     def __getitem__(self, idx):
         s = int(self.window_starts[idx])
         H = self.horizon
-        x0 = self.states[s]
-        xs = self.states[s + 1: s + 1 + H]          # [H, D]
-        us = self.cmds[s + 1: s + 1 + H]            # [H, 2]  (cmd on row k+1 drives k -> k+1)
-        return x0, us, xs, self.case_ids[idx]
-
+        return (self.states[s], self.cmds[s + 1: s + 1 + H], self.states[s + 1: s + 1 + H],
+                self.cmds[s], self.case_ids[idx])
+    
     # -- units --------------------------------------------------------------- #
     def position_rmse_mm(self, pred_states, true_states):
         """RMSE over node positions in millimetres, undoing normalisation."""
@@ -351,16 +349,23 @@ class KoopmanOperator(nn.Module):
     module docstring's Model section for that tradeoff.
     """
 
-    def __init__(self, koopman_dim, control_dim, bias=True):
+    def __init__(self, koopman_dim, control_dim, bias=True, control_lag =0, bilinear = 0):
         super().__init__()
         self.A = nn.Parameter(torch.eye(koopman_dim) + 0.01 * torch.randn(koopman_dim, koopman_dim))
         self.B = nn.Parameter(0.01 * torch.randn(koopman_dim, control_dim))
         # self.c = nn.Parameter(torch.zeros(koopman_dim)) if bias else None
+        self.C = nn.Parameter(0.01 * torch.randn(koopman_dim, control_dim)) if control_lag else None
+
+        self.N = (nn.Parameter(1e-3 * torch.randn(control_dim, koopman_dim, koopman_dim))
+                  if bilinear else None)
         self.register_buffer("_u_iter", torch.randn(koopman_dim))
 
-    def forward(self, z_k, u_k):
+    def forward(self, z_k, u_k, u_prev = None):
         z = z_k @ self.A.T + u_k @ self.B.T
-        #return z if self.c is None else z + self.c
+        if self.C is not None:
+            z = z + u_prev @ self.C.T
+        if self.N is not None:
+            z = z+ torch.einsum("bi,ijk,bj->bk", u_k, self.N, z_k)
         return z
 
     def spectral_norm(self, n_iter=2):
@@ -389,17 +394,16 @@ class KoopmanOperator(nn.Module):
 
 
 class KoopmanModel(nn.Module):
-    def __init__(self, state_dim, control_dim, koopman_dim, encoded_control_dim=16,
-                 hidden_dim=256, num_hidden=2, control_hidden_dim=64, control_num_hidden=2,
-                 operator_bias=True):
+    def __init__(self, state_dim, control_dim, koopman_dim,
+                 hidden_dim=256, num_hidden=2, operator_bias=True, control_lag = 0, bilinear = 0):
         super().__init__()
         self.encoder = KoopmanEncoder(state_dim, koopman_dim, hidden_dim, num_hidden)
         # self.input_encoder = InputEncoder(control_dim, encoded_control_dim,
         #                                    control_hidden_dim, control_num_hidden)
-        self.operator = KoopmanOperator(koopman_dim, encoded_control_dim, bias=operator_bias)
+        self.operator = KoopmanOperator(koopman_dim, control_dim, bias=operator_bias, control_lag=control_lag, bilinear=bilinear)
         self.decoder = KoopmanDecoder(koopman_dim, state_dim, hidden_dim, num_hidden)
 
-    def rollout(self, x0, us):
+    def rollout(self, x0, us, u_prev = None):
         """Encode once, then roll the latent forward under the recorded commands.
 
         Args:
@@ -414,8 +418,8 @@ class KoopmanModel(nn.Module):
         x_hat, z_hat = [], []
         for h in range(us.size(1)):
             # u_lifted = self.input_encoder(us[:, h])
-            u_lifted = us[:, h]  # Directly use the raw command - no input encoder
-            z = self.operator(z, u_lifted)
+            up = u_prev if h==0 else us[:, h-1]
+            z = self.operator(z, us[:, h], u_prev=up)
             z_hat.append(z)
             x_hat.append(self.decoder(z))
         return torch.stack(x_hat, 1), torch.stack(z_hat, 1), z0
@@ -437,17 +441,21 @@ class Loss:
                       watch when asking whether a linear operator is viable at all.
     stability      -- hinge on sigma_max(A); without it a model can ace one-step error
                       while its rollout diverges.
+    segment        -- inextensibility penalty on the predicted chain, 
+                    penalises edge lengths
+
     """
 
     def __init__(self, w_pred=1.0, w_recon=0.5, w_lin=0.1, w_stab=0.0, w_seg=0.0,
-                 pos_slice=None, pos_mean=None, pos_std=None, rest_len_mm=None,
-                 gamma=1.0, stab_margin=1.0):
+                 w_kin=0.0, dt=0.01,
+                 pos_slice=None, vel_slice=None, pos_mean=None, pos_std=None,
+                 rest_len_mm=None, gamma=1.0, stab_margin=1.0):
         self.w_pred, self.w_recon = w_pred, w_recon
         self.w_lin, self.w_stab = w_lin, w_stab
-        self.w_seg = w_seg
+        self.w_seg, self.w_kin, self.dt = w_seg, w_kin, dt
 
-        # Dataset params
         self.pos_slice = pos_slice
+        self.vel_slice = vel_slice
         self.rest_len_mm = rest_len_mm
         if pos_mean is None or pos_std is None or pos_slice is None:
             self._pos_mean = self._pos_std = None
@@ -456,6 +464,13 @@ class Loss:
                 np.asarray(pos_mean)[0, pos_slice], dtype=torch.float32)
             self._pos_std = torch.as_tensor(
                 np.asarray(pos_std)[0, pos_slice], dtype=torch.float32)
+        if vel_slice is None or pos_mean is None:
+            self._vel_mean = self._vel_std = None
+        else:
+            self._vel_mean = torch.as_tensor(
+                np.asarray(pos_mean)[0, vel_slice], dtype=torch.float32)
+            self._vel_std = torch.as_tensor(
+                np.asarray(pos_std)[0, vel_slice], dtype=torch.float32)
 
         self.gamma, self.stab_margin = gamma, stab_margin
         self.mse = nn.MSELoss(reduction="none")
@@ -508,16 +523,38 @@ class Loss:
         edge_len = torch.linalg.norm(p[..., 1:, :] - p[..., :-1, :], dim=-1)
         return ((edge_len - self.rest_len_mm) ** 2).mean()
 
+    def kinematic(self, x_hat, x0):
+        """Position and velocity blocks must describe the SAME motion:
+        p_{k+1} - p_k = dt * v_k. The decoder emits both independently, so without
+        this they can drift apart -- the model reports velocities its own positions
+        contradict. It also gives the velocity block a job that serves the position
+        block, rather than being fit for its own sake."""
+        if self.w_kin == 0.0 or self.vel_slice is None:
+            return torch.zeros((), device=x_hat.device)
+        if self._pos_mean.device != x_hat.device:
+            self._pos_mean = self._pos_mean.to(x_hat.device)
+            self._pos_std = self._pos_std.to(x_hat.device)
+            self._vel_mean = self._vel_mean.to(x_hat.device)
+            self._vel_std = self._vel_std.to(x_hat.device)
+
+        p = x_hat[..., self.pos_slice] * self._pos_std + self._pos_mean      # mm
+        v = x_hat[..., self.vel_slice] * self._vel_std + self._vel_mean      # mm/s
+        p0 = (x0[..., self.pos_slice] * self._pos_std + self._pos_mean).unsqueeze(1)
+        p_all = torch.cat([p0, p], dim=1)                                    # [B,H+1,60]
+        # v_k is the velocity AFTER step k, so it drives step k -> k+1
+        return ((p_all[:, 1:] - p_all[:, :-1] - self.dt * v[:, :-1]) ** 2).mean()
+    
     # -- total --------------------------------------------------------------- #
-    def __call__(self, model: KoopmanModel, x0, us, xs):
-        x_hat, z_hat, _ = model.rollout(x0, us)
+    def __call__(self, model: KoopmanModel, x0, us, xs, u_prev = None):
+        x_hat, z_hat, _ = model.rollout(x0, us, u_prev)
         pred, per_step = self.prediction(x_hat, xs) # multi-step rollout error: decode(rolled-forward z_k+h) vs x_k+h
         recon = self.reconstruction(model, x0, xs) # autoencoder consistency: decode(encode(x_k)) vs x_k
         lin = self.linearity(model, z_hat, xs) # latent linearity: encode(x_k+h) vs rolled-forward z_k+h
         stab = self.stability(model) # Hinge on sigma_max(A)
         seg = self.segment(x_hat) # Inextensibility penalty
-        total = self.w_pred * pred + self.w_recon * recon + self.w_lin * lin + self.w_stab * stab + self.w_seg * seg
-        parts = {"loss": total, "pred": pred, "recon": recon, "lin": lin, "stab": stab, "seg": seg}
+        kin = self.kinematic(x_hat, x0) # Kinematic consistency: p_{k+1} - p_k = dt * v_k 
+        total = self.w_pred * pred + self.w_recon * recon + self.w_lin * lin + self.w_stab * stab + self.w_seg * seg + self.w_kin * kin
+        parts = {"loss": total, "pred": pred, "recon": recon, "lin": lin, "stab": stab, "seg": seg, "kin": kin}
         return total, parts, x_hat, per_step
 
 
@@ -527,17 +564,17 @@ class Loss:
 def run_epoch(model, loader, device, loss_fn, dataset, optimizer=None, grad_clip=1.0):
     train = optimizer is not None
     model.train(train)
-    sums = {k: 0.0 for k in ("loss", "pred", "recon", "lin", "stab", "seg")}
+    sums = {k: 0.0 for k in ("loss", "pred", "recon", "lin", "stab", "seg", "kin")}
     n, per_step_sum = 0, None
     rmse_1, rmse_H = 0.0, 0.0
     per_case = {}
 
-    for x0, us, xs, case in loader:
-        x0, us, xs = x0.to(device), us.to(device), xs.to(device)
+    for x0, us, xs, u_prev, case in loader:
+        x0, us, xs, u_prev = x0.to(device), us.to(device), xs.to(device), u_prev.to(device)
         bs = x0.size(0)
 
         with torch.set_grad_enabled(train):
-            total, parts, x_hat, per_step = loss_fn(model, x0, us, xs)
+            total, parts, x_hat, per_step = loss_fn(model, x0, us, xs, u_prev=u_prev)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
@@ -584,10 +621,14 @@ def main():
     p.add_argument("--koopman-dim", type=int, default=256)
     p.add_argument("--hidden-dim", type=int, default=512)
     p.add_argument("--num-hidden", type=int, default=2)
-    p.add_argument("--encoded-control-dim", type=int, default=16,
+    p.add_argument("--encoded-control-dim", type=int, default=2,
                    help="Dim the raw 2-d (cmd_dx, cmd_dy) command is lifted into before the operator.")
     p.add_argument("--control-hidden-dim", type=int, default=64)
     p.add_argument("--control-num-hidden", type=int, default=2)
+    p.add_argument("--control-lag", type=int, default=0,choices=[0, 1], 
+                   help="If 1, the operator takes the previous command as an additional input.")
+    p.add_argument("--bilinear", type=int, default=0, choices=[0, 1],
+                   help="If 1, the operator has a bilinear term: z_k+1 = A z_k + B u_k + sum_i u_k[i] N[i] z_k")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -598,6 +639,7 @@ def main():
     p.add_argument("--w-lin", type=float, default=0.1)
     p.add_argument("--w-stab", type=float, default=0.0, help="Weight on the sigma_max(A) hinge.")
     p.add_argument("--w-seg", type=float, default=0.0, help="Weight on the inextensibility penalty.")
+    p.add_argument("--w-kin", type=float, default=0.0, help="Weight on the kinematic consistency penalty.")
     p.add_argument("--gamma", type=float, default=1.0, help="Horizon discount for pred/lin.")
     p.add_argument("--clamp-tol-mm", type=float, default=1.0,
                    help="Report the fraction of rows where node 0 missed its target by more than this.")
@@ -651,19 +693,18 @@ def main():
         state_dim=dataset.state_dim,
         control_dim=dataset.control_dim,
         koopman_dim=args.koopman_dim,
-        encoded_control_dim=args.encoded_control_dim,
         hidden_dim=args.hidden_dim,
         num_hidden=args.num_hidden,
-        control_hidden_dim=args.control_hidden_dim,
-        control_num_hidden=args.control_num_hidden,
         operator_bias=not args.no_operator_bias,
+        control_lag=args.control_lag,
+        bilinear=args.bilinear
     ).to(device)
 
     log(f"Parameters: {sum(q.numel() for q in model.parameters()):,}")
 
     loss_fn = Loss(w_pred=args.w_pred, w_recon=args.w_recon, w_lin=args.w_lin,
-                   w_stab=args.w_stab, w_seg=args.w_seg, gamma=args.gamma,
-                   pos_slice=dataset.pos_slice,
+                   w_stab=args.w_stab, w_seg=args.w_seg, w_kin=args.w_kin, wgamma=args.gamma,
+                   pos_slice=dataset.pos_slice, vel_slice=dataset.vel_slice,
                    pos_mean=dataset.state_mean, pos_std=dataset.state_std,
                    rest_len_mm=ROPE_LENGTH_MM / (dataset.num_nodes - 1))
     
@@ -683,12 +724,12 @@ def main():
 
         # Logging to console and TensorBoard
         log(f"epoch {epoch:03d} | train {tr['loss']:.5f} (pred {tr['pred']:.5f} "
-            f"recon {tr['recon']:.5f} lin {tr['lin']:.5f} seg {tr['seg']:.5f}) | val {va['loss']:.5f} "
-            f"(pred {va['pred']:.5f} seg {va['seg']:.5f}) | val rmse {va['rmse_1_mm']:.3f}/{va['rmse_H_mm']:.3f} mm "
+            f"recon {tr['recon']:.5f} lin {tr['lin']:.5f} seg {tr['seg']:.5f} kin {tr['kin']:.5f}) | val {va['loss']:.5f} "
+            f"(pred {va['pred']:.5f} seg {va['seg']:.5f} kin {va['kin']:.5f}) | val rmse {va['rmse_1_mm']:.3f}/{va['rmse_H_mm']:.3f} mm "
             f"| rho(A) {rho:.3f}{flag}")
 
         for split, m in (("train", tr), ("val", va)):
-            for k in ("loss", "pred", "recon", "lin", "stab", "seg", "rmse_1_mm", "rmse_H_mm"):
+            for k in ("loss", "pred", "recon", "lin", "stab", "seg", "kin", "rmse_1_mm", "rmse_H_mm"):
                 writer.add_scalar(f"{split}/{k}", m[k], epoch)
             # train vs val on one chart, so overfitting is visible at a glance
             writer.add_scalars("compare/pred", {split: m["pred"]}, epoch)
@@ -711,7 +752,7 @@ def main():
         torch.save(model.encoder.state_dict(), ckpt_dir / "koopman_enc.pt")
         torch.save(model.decoder.state_dict(), ckpt_dir / "koopman_dec.pt")
         torch.save(model.operator.state_dict(), ckpt_dir / "koopman_op.pt")
-        torch.save(model.input_encoder.state_dict(), ckpt_dir / "koopman_input_enc.pt")
+        #torch.save(model.input_encoder.state_dict(), ckpt_dir / "koopman_input_enc.pt")
 
     te = run_epoch(model, test_loader, device, loss_fn, dataset, optimizer=None)
     log(f"Test rollout MSE {te['pred']:.6f} | position RMSE "
@@ -726,10 +767,9 @@ def main():
     # Printing Koopman parameters for inspection
     log(f"Koopman operator A:\n{model.operator.A.detach().cpu().numpy()}")
     log(f"Koopman operator B:\n{model.operator.B.detach().cpu().numpy()}")
-    # if model.operator.c is not None:
-    #     log(f"Koopman operator c:\n{model.operator.c.detach().cpu().numpy()}")
+    log(f"Koopman operator C:\n{model.operator.C.detach().cpu().numpy()}" if model.operator.C is not None else "Koopman operator C: None")
         
-    for k in ("loss", "pred", "recon", "lin", "seg", "rmse_1_mm", "rmse_H_mm"):
+    for k in ("loss", "pred", "recon", "lin", "seg", "kin", "rmse_1_mm", "rmse_H_mm"):
         writer.add_scalar(f"test/{k}", te[k], args.epochs)
 
     # hparams view: every run in <results-dir>/runs shows up as one row, so a
@@ -745,12 +785,13 @@ def main():
             "encoded_control_dim": args.encoded_control_dim,
             "control_hidden_dim": args.control_hidden_dim,
             "control_num_hidden": args.control_num_hidden,
+            "control_lag": args.control_lag,
         },
         {
             "hparam/val_pred": best_val, "hparam/test_pred": te["pred"],
             "hparam/test_rmse_1_mm": te["rmse_1_mm"],
             "hparam/test_rmse_H_mm": te["rmse_H_mm"],
-            "hparam/test_lin": te["lin"], "hparam/test_seg": te["seg"], "hparam/rho_A": model.operator.spectral_radius(),
+            "hparam/test_lin": te["lin"], "hparam/test_seg": te["seg"], "hparam/test_kin": te["kin"], "hparam/rho_A": model.operator.spectral_radius(),
         },
     )
     results_file.close()

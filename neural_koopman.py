@@ -35,7 +35,7 @@ as observables.
 Model
 -----
   encoder   : MLP,    x_k          -> z_k                    (lifted / Koopman space)
-  operator  : affine, z_k, u_k     -> z_k+1 = A z_k + B u_k + c
+  operator  : affine, z_k, u_k     -> z_k+1 = A z_k + B u_k 
   decoder   : MLP,    z            -> x_hat                  (full state vector)
 
 Losses (see KoopmanLoss)
@@ -76,7 +76,7 @@ FEATURE_GROUPS = {
     "curv":   (("curvature_",), "node"),
     "edge":   (("edge_dx_", "edge_dy_", "edge_length_"), "edge"),
 }
-DEFAULT_FEATURES = ("pos") 
+DEFAULT_FEATURES = ("pos", "vel") 
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
@@ -315,7 +315,7 @@ class KoopmanDecoder(nn.Module):
 
 
 class KoopmanOperator(nn.Module):
-    """Affine latent dynamics with control: z_k+1 = A z_k + B u_k + c.
+    """Affine latent dynamics with control: z_k+1 = A z_k + B u_k 
 
     A starts near identity: one sim step changes the state only slightly, so the
     untrained operator is roughly the identity map, which keeps early rollouts stable.
@@ -327,12 +327,13 @@ class KoopmanOperator(nn.Module):
         super().__init__()
         self.A = nn.Parameter(torch.eye(koopman_dim) + 0.01 * torch.randn(koopman_dim, koopman_dim))
         self.B = nn.Parameter(0.01 * torch.randn(koopman_dim, control_dim))
-        self.c = nn.Parameter(torch.zeros(koopman_dim)) if bias else None
+        # self.c = nn.Parameter(torch.zeros(koopman_dim)) if bias else None
         self.register_buffer("_u_iter", torch.randn(koopman_dim))
 
     def forward(self, z_k, u_k):
         z = z_k @ self.A.T + u_k @ self.B.T
-        return z if self.c is None else z + self.c
+        #return z if self.c is None else z + self.c
+        return z
 
     def spectral_norm(self, n_iter=2):
         """Largest singular value of A via power iteration.
@@ -532,7 +533,6 @@ def main():
     p.add_argument("--no-operator-bias", action="store_true")
     p.add_argument("--results-dir", type=str,
                    default="training_results", help="Directory to save logs and TensorBoard runs.")
-    p.add_argument("--save", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -583,11 +583,14 @@ def main():
         num_hidden=args.num_hidden,
         operator_bias=not args.no_operator_bias,
     ).to(device)
+
     log(f"Parameters: {sum(q.numel() for q in model.parameters()):,}")
 
     loss_fn = KoopmanLoss(w_pred=args.w_pred, w_recon=args.w_recon, w_lin=args.w_lin,
                           w_stab=args.w_stab, gamma=args.gamma)
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
     best_val, best_state = float("inf"), None
 
     for epoch in range(1, args.epochs + 1):
@@ -599,9 +602,8 @@ def main():
         if va["pred"] < best_val:
             best_val, flag = va["pred"], "  *"
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            if args.save:
-                torch.save({"model": model.state_dict(), "args": vars(args), "epoch": epoch}, args.save)
 
+        # Logging to console and TensorBoard
         log(f"epoch {epoch:03d} | train {tr['loss']:.5f} (pred {tr['pred']:.5f} "
             f"recon {tr['recon']:.5f} lin {tr['lin']:.5f}) | val {va['loss']:.5f} "
             f"(pred {va['pred']:.5f}) | val rmse {va['rmse_1_mm']:.3f}/{va['rmse_H_mm']:.3f} mm "
@@ -624,6 +626,14 @@ def main():
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+        # Save best pt file - koopman_enc.pt, koopman_dec.pt, koopman_op.pt
+        ckpt_dir = results_dir / "checkpoints" / exp_name
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.encoder.state_dict(), ckpt_dir / "koopman_enc.pt")
+        torch.save(model.decoder.state_dict(), ckpt_dir / "koopman_dec.pt")
+        torch.save(model.operator.state_dict(), ckpt_dir / "koopman_op.pt")
+
     te = run_epoch(model, test_loader, device, loss_fn, dataset, optimizer=None)
     log(f"Test rollout MSE {te['pred']:.6f} | position RMSE "
         f"{te['rmse_1_mm']:.3f} mm @h=1, {te['rmse_H_mm']:.3f} mm @h={args.horizon}")
@@ -637,8 +647,8 @@ def main():
     # Printing Koopman parameters for inspection
     log(f"Koopman operator A:\n{model.operator.A.detach().cpu().numpy()}")
     log(f"Koopman operator B:\n{model.operator.B.detach().cpu().numpy()}")
-    if model.operator.c is not None:
-        log(f"Koopman operator c:\n{model.operator.c.detach().cpu().numpy()}")
+    # if model.operator.c is not None:
+    #     log(f"Koopman operator c:\n{model.operator.c.detach().cpu().numpy()}")
         
     for k in ("loss", "pred", "recon", "lin", "rmse_1_mm", "rmse_H_mm"):
         writer.add_scalar(f"test/{k}", te[k], args.epochs)

@@ -1,0 +1,2 @@
+shape,best_rmse_mm,settled_rmse_mm,settled_vmax_mm_s,recon_floor_mm,best_step,steps_solved,goal_z_max,node0_travel_mm,exploded
+rope_C,6.880,7.066,0.0767,5.501,254,314,1.285,313.2,False

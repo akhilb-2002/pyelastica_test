@@ -309,7 +309,7 @@ def animate_3d(plot_params, video_name="rope_3d.gif", fps=30, save=True):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Animate the PyElastica rope manipulation env.")
     ap.add_argument("--csv", default=None, help="Animate trajectories from a collected CSV.")
-    ap.add_argument("--traj", type=int, default=None,
+    ap.add_argument("--traj", type=int, default=5,
                     help="Restrict to one trajectory_id (default: all trajectories).")
     ap.add_argument("--view", choices=["xy", "xz", "3d"], default="xy")
     ap.add_argument("--out", default=None, help="Output filename (.gif or .mp4).")

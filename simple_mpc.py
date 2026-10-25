@@ -1,27 +1,33 @@
 """
 letter_mpc.py -- Koopman MPC for tracing letter shapes with the rope.
 
-The optimisation runs entirely in latent space. The encoder is an MLP, so it
-cannot go inside the solver; instead the measured state is encoded ONCE per MPC
-step (outside CasADi) and becomes a parameter. Inside the solver the dynamics are
+POSITION-ONLY MODEL. The state is the 60-d node position vector; there is no
+velocity block, so the state is not strictly Markov for a second-order rod. That
+is acceptable here because the controller is run quasi-statically: at <= 1.5
+mm/step the rope tracks equilibrium rather than swinging, and whatever transient
+remains is removed by the settle phase. It also removes the velocity-weighting
+question from the tracking cost entirely.
+
+The optimisation runs in latent space. The encoder is an MLP, so it cannot go
+inside the solver; the measured state is encoded ONCE per MPC step (outside
+CasADi) and becomes a parameter. Inside the solver the dynamics are
 
     z_{k+1} = A z_k + B u_k
 
-which is linear in the raw mm command (B is divided by cmd_scale because the
-operator was trained on u / cmd_scale), so the whole OCP is a QP and the command
-box |u| <= U_MAX sits directly on the decision variable.
+linear in the raw mm command (B is divided by cmd_scale because the operator was
+trained on u / cmd_scale), so the OCP is a QP and the command box sits directly
+on the decision variable.
 
-Tracking is on the LATENT error z - z_goal, weighted by J^T J with J the decoder
-Jacobian at the goal, which makes it a first-order proxy for mm position error.
-The decoder itself cannot go inside the solver without destroying the QP.
+Tracking is on the LATENT error z - z_goal weighted by J^T J, with J the decoder
+Jacobian at the goal. That makes the latent cost a first-order proxy for mm
+position error -- necessary because the decoder is not an isometry, so an
+identity-weighted latent cost can fall while the physical error rises.
 
 Each run ends with a SETTLE phase at the BEST step, not the last one. The stall
-counter only fires N steps after the minimum and the controller keeps driving in
-the meantime, so settling from the last step locks in that overshoot. The command
-history is replayed from a fresh reset up to the best step instead (replay is
-deterministic: same reset, same commands, same trajectory), and the damper then
-brings the rope to rest. The settled shape is the honest result -- a letter that
-only exists while the rope is moving is not a letter.
+counter fires N steps after the minimum and the controller keeps driving in the
+meantime, so settling from the last step locks in that overshoot. The commands
+are replayed from a fresh reset up to the best step instead (replay is
+deterministic), and the damper then brings the rope to rest.
 
 Per-shape outputs (in --out-dir):
     <name>.gif            drive + settle animation
@@ -56,7 +62,7 @@ def run_shape(args, shape_path, ctx):
     (dataset stats, model, A, B, env) so the model loads once across a batch."""
     dataset, model, env = ctx["dataset"], ctx["model"], ctx["env"]
     mean, std = ctx["mean"], ctx["std"]
-    pos_slice, vel_slice = ctx["pos_slice"], ctx["vel_slice"]
+    pos_slice = ctx["pos_slice"]
     n_nodes, z_dim = ctx["n_nodes"], ctx["z_dim"]
     A_np, B_np = ctx["A_np"], ctx["B_np"]
 
@@ -66,29 +72,28 @@ def run_shape(args, shape_path, ctx):
     print(f"\n{'=' * 72}\n=== {name}\n{'=' * 72}")
 
     # ---- goal --------------------------------------------------------------
+    # Position-only: the state IS the flattened node positions, no velocity block.
     J = json.load(open(shape_path))
     goal_pos = np.array(J["nodes"], dtype=np.float32)
     assert goal_pos.shape == (n_nodes, 2)
 
-    x_goal = np.zeros(dataset.state_dim, dtype=np.float32)
-    x_goal[dataset.feature_slices["pos"]] = goal_pos.reshape(-1)
+    x_goal = goal_pos.reshape(-1).astype(np.float32)
     xg = (torch.as_tensor(x_goal).unsqueeze(0) - mean) / std
 
     with torch.no_grad():
         rec = model.decoder(model.encoder(xg)) * std + mean
-    rec_pos = rec[0, pos_slice].reshape(n_nodes, 2).numpy()
+    rec_pos = rec[0].reshape(n_nodes, 2).numpy()
     floor = float(np.sqrt(((rec_pos - goal_pos) ** 2).sum(1).mean()))
+    rseg = np.linalg.norm(np.diff(rec_pos, axis=0), axis=1)
+    rest_len = J["rope_length"] / (n_nodes - 1)
     print(f"goal |z| max = {xg.abs().max().item():.3f}")
-    print(f"goal recon RMSE = {floor:.3f} mm")
+    print(f"goal recon RMSE = {floor:.3f} mm | recon seg strain "
+          f"{100 * (rseg.max() - rest_len) / rest_len:+.2f}%")
 
     env.reset()          # fresh straight rope for every shape
 
     def measure():
-        s = np.zeros(dataset.state_dim, dtype=np.float32)
-        s[dataset.feature_slices["pos"]] = env.get_positions(mm=True)[:, :2].reshape(-1)
-        if "vel" in dataset.feature_slices:
-            s[dataset.feature_slices["vel"]] = env.get_velocities(mm=True)[:, :2].reshape(-1)
-        return s
+        return env.get_positions(mm=True)[:, :2].reshape(-1).astype(np.float32)
 
     def encode(state_mm):
         xn = (torch.as_tensor(state_mm).unsqueeze(0) - mean) / std
@@ -103,20 +108,17 @@ def run_shape(args, shape_path, ctx):
         return float(np.abs(env.get_velocities(mm=True)[:, :2]).max())
 
     # ---- Jacobian-weighted cost -------------------------------------------
+    # J maps latent perturbations to mm position perturbations, so e^T J^T J e is
+    # a second-order-accurate proxy for squared mm error near the goal.
     zg_t = torch.tensor(encode(x_goal), dtype=torch.float32)
-    w_vel = args.w_vel
-
-    def dec_pv(z):
-        out = model.decoder(z.unsqueeze(0))[0]
-        return torch.cat([out[pos_slice], w_vel * out[vel_slice]])
-
-    Jt = torch.autograd.functional.jacobian(dec_pv, zg_t)
-    scale = np.concatenate([dataset.state_std[0, pos_slice],
-                            dataset.state_std[0, vel_slice]])
-    Jd = (Jt.numpy() * scale[:, None]).astype(np.float64)
+    Jt = torch.autograd.functional.jacobian(
+        lambda z: model.decoder(z.unsqueeze(0))[0], zg_t)          # (60, z_dim)
+    Jd = (Jt.numpy() * dataset.state_std[0][:, None]).astype(np.float64)   # -> mm
     Q = Jd.T @ Jd
+    # rank(J^T J) <= 60 << z_dim, so without a floor the solver can drift freely
+    # through the ~200 latent directions that cost nothing.
     Q += 1e-4 * (np.trace(Q) / z_dim) * np.eye(z_dim)
-    Q /= (np.trace(Q) / z_dim)
+    Q /= (np.trace(Q) / z_dim)             # unit mean eigenvalue: r-weight portable
     print(f"Q cond {np.linalg.cond(Q):.2e}  rank(Jd) {np.linalg.matrix_rank(Jd)}")
 
     # ---- QP, built once and re-solved with new parameters each step --------
@@ -148,8 +150,13 @@ def run_shape(args, shape_path, ctx):
     # ---- closed loop -------------------------------------------------------
     start_pos = env.get_positions(mm=True)[:, :2].copy()
     total_travel = float(np.linalg.norm(goal_pos[0] - start_pos[0]))
+    min_steps = int(total_travel / args.u_max)
+    # Reaching a hooked shape (J, S, ...) requires moving AWAY from the goal
+    # first, so an early monotonic-improvement test kills the run before the rope
+    # has curled at all. Scale the grace period to the travel the shape needs.
+    stall_after = max(args.stall_after, int(1.5 * min_steps))
     print(f"node-0 must travel {total_travel:.1f} mm; at {args.u_max} mm/step "
-          f">= {int(total_travel / args.u_max)} steps")
+          f">= {min_steps} steps | stall test active after t={stall_after}")
 
     hist, shapes, vhist, u_list = [], [], [], []
     best_rmse, best_shape, best_t, stall = np.inf, None, 0, 0
@@ -161,9 +168,7 @@ def run_shape(args, shape_path, ctx):
         if args.ref_rate > 0:
             alpha = min(1.0, (t * args.ref_rate) / max(total_travel, 1e-6))
             ref_pos = (1 - alpha) * start_pos + alpha * goal_pos
-            x_ref = np.zeros(dataset.state_dim, dtype=np.float32)
-            x_ref[dataset.feature_slices["pos"]] = ref_pos.reshape(-1)
-            z_ref = encode(x_ref)
+            z_ref = encode(ref_pos.reshape(-1).astype(np.float32))
         else:
             z_ref = encode(x_goal)
 
@@ -198,7 +203,7 @@ def run_shape(args, shape_path, ctx):
             best_rmse, best_shape, best_t, stall = rmse, cur.copy(), t, 0
         else:
             stall += 1
-            if stall > args.stall and t > 200:
+            if t > stall_after and stall > args.stall:
                 print(f"  no improvement for {args.stall} steps -- stop at t={t}; "
                       f"best {best_rmse:.2f} mm at t={best_t}")
                 break
@@ -207,8 +212,6 @@ def run_shape(args, shape_path, ctx):
     print(f"driven:  last {hist[-1]:.2f} mm   best {best_rmse:.2f} mm at t={best_t}")
 
     # ---- rewind to the best step -------------------------------------------
-    # PyElastica has no rewind, so replay the recorded commands from a fresh
-    # reset. Deterministic, so this reproduces the best state exactly.
     if not args.no_rewind and best_t < len(hist) - 1:
         print(f"rewinding to t={best_t} ...")
         env.reset()
@@ -219,7 +222,7 @@ def run_shape(args, shape_path, ctx):
             hist.append(rmse_now()); vhist.append(vmax_now())
         print(f"  replayed to {hist[-1]:.2f} mm (expected {best_rmse:.2f} mm)")
 
-    u_applied = np.array(u_list[:len(hist)], dtype=np.float64)     # (n_driven, 2)
+    u_applied = np.array(u_list[:len(hist)], dtype=np.float64)
     n_driven = len(hist)
 
     # ---- settle ------------------------------------------------------------
@@ -233,28 +236,25 @@ def run_shape(args, shape_path, ctx):
 
     final = env.get_positions(mm=True)[:, :2]
     settled_rmse, settled_v = hist[-1], vhist[-1]
+    fseg = np.linalg.norm(np.diff(final, axis=0), axis=1)
     print(f"settled: RMSE {settled_rmse:.2f} mm   max|v| {settled_v:.4f} mm/s   "
+          f"seg strain {100 * (fseg.max() - rest_len) / rest_len:+.2f}%   "
           f"(best driven {best_rmse:.2f}, floor {floor:.2f})")
 
-    shapes_arr = np.stack(shapes)                                  # (F, N, 2)
-    tip_path = shapes_arr[:n_driven, 0, :]                         # (n_driven, 2) mm
+    shapes_arr = np.stack(shapes)
+    tip_path = shapes_arr[:n_driven, 0, :]
 
     # ---- save the command / settle record ----------------------------------
-    # tip_path is the absolute node-0 trajectory: it is what a robot would follow
-    # as a position reference, independent of how fast it is executed.
+    # tip_path is the absolute node-0 trajectory: what a robot would follow as a
+    # position reference, independent of how fast it is executed.
     npz_path = out_dir / f"{name}_commands.npz"
     np.savez_compressed(
         npz_path,
-        commands_mm=u_applied,           # per-step node-0 displacement (mm)
-        tip_path_mm=tip_path,            # absolute node-0 positions (mm)
-        shapes_mm=shapes_arr,            # every node, every frame (mm)
-        rmse_mm=np.array(hist),
-        vmax_mm_s=np.array(vhist),
-        goal_nodes_mm=goal_pos,
-        settled_nodes_mm=final,
+        commands_mm=u_applied, tip_path_mm=tip_path, shapes_mm=shapes_arr,
+        rmse_mm=np.array(hist), vmax_mm_s=np.array(vhist),
+        goal_nodes_mm=goal_pos, settled_nodes_mm=final,
         best_nodes_mm=best_shape if best_shape is not None else np.zeros((0, 2)),
-        n_driven=n_driven,               # frames before the settle begins
-        n_settle=len(hist) - n_driven,
+        n_driven=n_driven, n_settle=len(hist) - n_driven,
         best_step=best_t, best_rmse_mm=best_rmse,
         settled_rmse_mm=settled_rmse, settled_vmax_mm_s=settled_v,
         recon_floor_mm=floor, control_dt=env.control_dt,
@@ -286,7 +286,7 @@ def run_shape(args, shape_path, ctx):
     if not args.no_anim:
         idx = list(range(0, len(shapes), args.anim_every))
         if idx[-1] != len(shapes) - 1:
-            idx.append(len(shapes) - 1)              # always end on the settled shape
+            idx.append(len(shapes) - 1)          # always end on the settled shape
 
         allpts = np.concatenate([shapes_arr.reshape(-1, 2), goal_pos])
         pad = 20.0
@@ -348,14 +348,13 @@ def run_shape(args, shape_path, ctx):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shape", default="rope_all_shapes/rope_I.json")
-    ap.add_argument("--all", action="store_true",
-                    help="run every *.json in --shape-dir")
+    ap.add_argument("--all", action="store_true", help="run every *.json in --shape-dir")
     ap.add_argument("--shape-dir", default="rope_all_shapes")
     ap.add_argument("--out-dir", default="koopman_mpc_outputs")
     ap.add_argument("--show", action="store_true",
                     help="display figures (off by default so --all runs unattended)")
     ap.add_argument("--results-dir", default="training_results")
-    ap.add_argument("--exp-name", default="exp_simple_1788069999")
+    ap.add_argument("--exp-name", default="exp_simple_1788269928")
     ap.add_argument("--H", type=int, default=10, help="prediction horizon")
     ap.add_argument("--K", type=int, default=10, help="control horizon (K <= H)")
     ap.add_argument("--u-max", type=float, default=1.5,
@@ -363,9 +362,11 @@ def main():
     ap.add_argument("--du-max", type=float, default=0.3)
     ap.add_argument("--r-weight", type=float, default=1e-1)
     ap.add_argument("--terminal-weight", type=float, default=50)
-    ap.add_argument("--w-vel", type=float, default=0.05)
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--stall", type=int, default=40)
+    ap.add_argument("--stall-after", type=int, default=150,
+                    help="minimum step before the stall test may fire; also scaled "
+                         "to 1.5x the travel-limited step count per shape")
     ap.add_argument("--settle", type=int, default=600)
     ap.add_argument("--no-rewind", action="store_true",
                     help="settle from the LAST step instead of the best one")
@@ -395,22 +396,22 @@ def main():
         ta["csv"], features=tuple(ta["features"]), horizon=1,
         normalize=not ta.get("no_normalize", False), clamp_tol_mm=None,
     )
+    if "vel" in dataset.feature_slices:
+        raise SystemExit("this script is the POSITION-ONLY variant, but the checkpoint "
+                         "was trained with a velocity block. Use the pos+vel version.")
+
     mean = torch.as_tensor(dataset.state_mean[0])
     std = torch.as_tensor(dataset.state_std[0])
     pos_slice = dataset.pos_slice
-    vel_slice = dataset.feature_slices["vel"]
-    n_nodes = (pos_slice.stop - pos_slice.start) // 2
+    n_nodes = dataset.state_dim // 2
     cmd_scale = dataset.cmd_scale
 
     model = KoopmanModel(
         state_dim=dataset.state_dim,
         control_dim=dataset.control_dim,
         koopman_dim=ta["koopman_dim"],
-        encoded_control_dim=ta.get("encoded_control_dim", 16),
         hidden_dim=ta["hidden_dim"],
         num_hidden=ta["num_hidden"],
-        control_hidden_dim=ta.get("control_hidden_dim", 64),
-        control_num_hidden=ta.get("control_num_hidden", 2),
         operator_bias=not ta.get("no_operator_bias", False),
     ).to(device)
 
@@ -429,7 +430,8 @@ def main():
     rho = np.abs(np.linalg.eigvals(A_np)).max()
     if args.project_rho > 0 and rho > args.project_rho:
         A_np = A_np * (args.project_rho / rho)
-    print(f"A {A_np.shape}  B {B_np.shape}  rho(A) {rho:.6f} -> "
+    print(f"state_dim {dataset.state_dim} (pos only, {n_nodes} nodes) | "
+          f"A {A_np.shape}  B {B_np.shape} | rho(A) {rho:.6f} -> "
           f"{np.abs(np.linalg.eigvals(A_np)).max():.6f}")
 
     env = RopeManipEnv(n_nodes=n_nodes, base_length=0.30, base_radius=0.003,
@@ -438,8 +440,8 @@ def main():
     env.reset()
 
     ctx = dict(dataset=dataset, model=model, env=env, mean=mean, std=std,
-               pos_slice=pos_slice, vel_slice=vel_slice, n_nodes=n_nodes,
-               z_dim=z_dim, A_np=A_np, B_np=B_np)
+               pos_slice=pos_slice, n_nodes=n_nodes, z_dim=z_dim,
+               A_np=A_np, B_np=B_np)
 
     if args.all:
         shapes_in = sorted(Path(args.shape_dir).glob("*.json"))

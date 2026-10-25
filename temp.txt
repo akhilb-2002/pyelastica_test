@@ -1,0 +1,22 @@
+Good evening sir, I hope you are doing well! 
+
+Wishing you a very happy teacher's day sir! Congratulations on winning the best teacher award also sir! Really happy to hear it!
+
+Regarding the project work, couple of updates sir. I trained the networks on the below architecture as mentioned earlier. 
+Couple of small features sir, 
+
+1. The input state for the rope was taken as [positions of nodes, velocity of nodes]. I tried training with only position of nodes but the drift in the Koopman space was very high, and not converging for shape tracking sir.
+The results with [x, v] was a bit better sir but not perfect. 
+
+2. I used an LQR to find the inputs for shape tracking for 4 letters, and the results were as below. Visually the cases look decent sir, but the RMSE still seems to be pretty high, ~ 40 mm for some cases over a 300mm rope. 
+The other issue is the rope doesn't seem to be stopping at the end position, the momentum it carries is high and settling doesn't appear to take place in the right optimal position.
+
+3. I tried other methods to debug the issue, I started with a simpler position only space but the drift in thr Koopman space was high and the dynamics were not being captured. On adding velocity, it seems to learn a bit better but controlling the rope seems to be even more difficult.
+
+Among the other unsuccessful runs, I have attached the params for the best run I had till now in the image.
+
+With the ICRA deadline approaching, I was a bit tensed and worried about not having the best results sir. If it is alright sir, could we have a small meeting to discuss the next steps sir as I am struggling for better ideas and wanted to seek guidance on how to approach this problem better?
+
+I have a gut feeling that Koopman is a good approach but I am somehow not able to find the appropriate formulation and the best state to use. 
+
+Kindly looking forward to your reply for further guidance sir. I would be grateful to move ahead with your inputs. 
